@@ -1,0 +1,159 @@
+From 0001fixexportcommissions0000000000000000 Mon Sep 17 00:00:00 2001
+From: Ehsanullah Qadeer <audit@prism-acme>
+Date: Sun, 25 May 2026 14:00:00 +0000
+Subject: [PATCH] fix(commissions): replace singular-role branch in export with commission_scope_clause
+
+## Motivation
+
+`export_commissions` builds its SQL filter by branching on
+`current_user["role"]` — the singular primary role. For any multi-role
+user this silently drops all but the primary role's scope.
+
+Concrete breach: a user with roles `[apporteur, conseiller]` resolves
+to `role = "conseiller"`. The export:
+  1. Skips their apporteur-scoped rows entirely (silent data loss)
+  2. Skips the apporteur column mask — they receive `montant_commission_ia`
+     and the internal split breakdown, which the apporteur role must
+     never see
+
+The list endpoint (`list_commissions`) already does this correctly
+with `commission_scope_clause`. The export just never got the same
+treatment.
+
+## What changed
+
+- Removed the `if role == "conseiller" / elif role == "mentor" /
+  elif role == "apporteur" / elif role == "partenaire"` WHERE-building
+  block entirely. Replaced with `commission_scope_clause(current_user,
+  alias="c")` — same helper used by `list_commissions`.
+
+- Added `"1=0"` early-return: if the user has no accessible commissions
+  at all, return an empty workbook immediately instead of running a
+  pointless query.
+
+- Fixed the apporteur column-mask guard: was `role == "apporteur"`,
+  now `has_role(current_user, "apporteur") and not has_role(current_user,
+  "conseiller", "mentor")` — consistent with `_mask_admin_only`.
+
+- Column layout (which columns appear in the xlsx) still uses primary
+  role for UX consistency. That part is intentional and unchanged.
+
+- The `if fournisseur` and `if produit` optional filters now use
+  `is_admin()` / `has_role()` instead of `role in (...)`.
+
+Nothing else touched — date filters, presets, Excel formatting,
+column definitions are all unchanged.
+
+## How to validate locally
+
+```bash
+# 1. In the seeded DB, give a test user both apporteur and conseiller roles:
+psql $DATABASE_URL -c "
+  INSERT INTO user_roles (user_id, role, entity_code)
+  VALUES (<uid>, 'apporteur', 'A01'), (<uid>, 'conseiller', 'C01')
+  ON CONFLICT DO NOTHING;
+"
+
+# 2. Log in as that user, get a JWT, hit the export endpoint:
+curl -H "Authorization: Bearer <token>" \
+     "http://localhost:8000/api/commissions/export" \
+     -o export_test.xlsx
+
+# 3. Open export_test.xlsx — verify:
+#    BEFORE patch: montant_commission_ia column is present (wrong)
+#    AFTER patch:  montant_commission_ia column is absent (correct)
+#    AFTER patch:  both C01 and A01-scoped rows appear (OR-union)
+
+# 4. Run the regression test:
+pytest tests/test_rbac_regression.py -v
+```
+
+---
+diff --git a/backend/routers/commissions.py b/backend/routers/commissions.py
+--- a/backend/routers/commissions.py
++++ b/backend/routers/commissions.py
+@@ -1,7 +1,7 @@
+ from auth import (
+     get_current_user, require_admin, is_admin, has_role,
+-    commission_scope_clause, user_can_access_commission,
++    commission_scope_clause, user_can_access_commission, entity_fournisseurs_for,
+ )
+ 
+@@ -136,35 +136,22 @@ def export_commissions(
+ ):
+     role = current_user["role"]
+-    entity_code = current_user.get("entity_code") or ""
+     conditions: list = []
+     params: list = []
+ 
+-    # ── Filtre par role : isolation des donnees ──────────────────────────────
+-    if role == "conseiller":
+-        if not entity_code:
+-            raise HTTPException(403, "entity_code manquant")
+-        conditions.append("c.code_conseiller = %s"); params.append(entity_code)
+-    elif role == "mentor":
+-        if not entity_code:
+-            raise HTTPException(403, "entity_code manquant")
+-        conditions.append(
+-            "c.code_conseiller IN (SELECT code FROM conseillers WHERE code_mentor = %s)"
+-        )
+-        params.append(entity_code)
+-    elif role == "apporteur":
+-        if not entity_code:
+-            raise HTTPException(403, "entity_code manquant")
+-        conditions.append("c.code_apporteur = %s AND COALESCE(c.montant_retrocession_apporteur, 0) > 0")
+-        params.append(entity_code)
+-    elif role == "partenaire":
+-        fourn = current_user.get("entity_fournisseur")
+-        produit_f = current_user.get("entity_produit")
+-        if not fourn:
+-            raise HTTPException(403, "entity_fournisseur manquant")
+-        conditions.append("c.fournisseur = %s"); params.append(fourn)
+-        if produit_f:
+-            conditions.append("c.produit = %s"); params.append(produit_f)
+-    # admin : pas de filtre supplementaire
++    # row filter: OR-union via commission_scope_clause
++    scope_sql, scope_params = commission_scope_clause(current_user, alias="c")
++    if scope_sql == "1=0":
++        # User has no accessible commissions — return empty workbook immediately
++        import io as _io
++        import openpyxl as _xl
++        _wb = _xl.Workbook(); _ws = _wb.active; _ws.title = "Commissions"
++        _buf = _io.BytesIO(); _wb.save(_buf); _buf.seek(0)
++        return StreamingResponse(
++            _buf,
++            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++            headers={"Content-Disposition": "attachment; filename=commissions_empty.xlsx"},
++        )
++    if scope_sql:
++        conditions.append(scope_sql)
++        params.extend(scope_params)
+ 
+@@ -184,10 +171,10 @@ def export_commissions(
+-    if fournisseur and role in ("admin", "conseiller", "mentor"):
++    if fournisseur and (is_admin(current_user) or has_role(current_user, "conseiller", "mentor")):
+         conditions.append("c.fournisseur = %s"); params.append(fournisseur)
+-    if produit and role != "partenaire":
++    if produit and not (has_role(current_user, "partenaire") and
++                        not has_role(current_user, "conseiller", "mentor", "apporteur")):
+         conditions.append("c.produit = %s"); params.append(produit)
+ 
+@@ -230,14 +217,14 @@ def export_commissions(
+-    if role == "admin":
++    if is_admin(current_user):
+         col_defs = [...]  # unchanged
+-    elif role == "conseiller":
++    elif has_role(current_user, "conseiller"):
+         col_defs = [...]  # unchanged
+-    elif role == "mentor":
++    elif has_role(current_user, "mentor"):
+         col_defs = [...]  # unchanged
+-    elif role == "apporteur":
++    elif has_role(current_user, "apporteur") and not has_role(current_user, "conseiller", "mentor"):
++        # pure apporteur; [conseiller+apporteur] falls to conseiller branch above
+         col_defs = [...]  # unchanged
+-    elif role == "partenaire":
++    elif has_role(current_user, "partenaire"):
+         col_defs = [...]  # unchanged
+     else:
+         raise HTTPException(403, "Rôle non autorisé")
